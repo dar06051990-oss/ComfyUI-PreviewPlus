@@ -1,10 +1,10 @@
-
 [project]
 name = "comfyui-previewplus"
 version = "1.0.0"
 description = "Image preview and manual or automatic saving with generation metadata and optional workflow."
 requires-python = ">=3.10"
 dependencies = []
+license = "MIT"
 
 [tool.comfy]
 PublisherId = "dar06051990-oss"
