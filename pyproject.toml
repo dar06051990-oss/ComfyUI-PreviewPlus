@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-previewplus"
-version = "1.0.0"
+version = "1.0.1"
 description = "Image preview and manual or automatic saving with generation metadata and optional workflow."
 requires-python = ">=3.10"
 dependencies = []
