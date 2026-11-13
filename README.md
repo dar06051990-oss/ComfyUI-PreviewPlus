@@ -56,6 +56,16 @@ Settings are kept at `<ComfyUI user directory>/preview_plus/settings.json` rathe
 
 The node embeds information collected from the execution graph. Model-specific parameters, custom sampler implementations and some unusual prompt structures may not be fully represented in the human-readable fields. Full workflow data is the more complete record where supported.
 
+## Publishing to ComfyUI Registry (maintainers)
+
+The repository contains [a GitHub Actions workflow](.github/workflows/publish-registry.yml) that publishes the version in `pyproject.toml` to ComfyUI Registry:
+
+1. In [ComfyUI Registry](https://registry.comfy.org/), generate a publisher API token for the publisher matching `[tool.comfy].PublisherId`.
+2. In GitHub, open **Settings > Secrets and variables > Actions > New repository secret**. Set the name to `REGISTRY_ACCESS_TOKEN` and paste the token as the secret value. Never commit or share this token.
+3. To publish the existing version for the first time, open **Actions > Publish PreviewPlus to Comfy Registry > Run workflow**, select `main`, and run it.
+4. For later releases, bump `[project].version` in `pyproject.toml` and push the change to `main`. The workflow will publish automatically. Publishing a GitHub Release alone does not trigger Registry publication.
+
+Registry versions are immutable: do not rerun a successful publication of the same version.
 ## Notes
 
 - The image preview uses ComfyUI's temporary directory. **Auto Save OFF** does not create permanent output files from this node.
