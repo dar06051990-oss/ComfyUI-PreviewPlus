@@ -6,6 +6,10 @@ requires-python = ">=3.10"
 dependencies = []
 license = "MIT"
 
+[project.urls]
+Repository = "https://github.com/dar06051990-oss/ComfyUI-PreviewPlus"
+Homepage = "https://github.com/dar06051990-oss/ComfyUI-PreviewPlus"
+
 [tool.comfy]
 PublisherId = "dar06051990-oss"
 DisplayName = "ComfyUI-PreviewPlus"
