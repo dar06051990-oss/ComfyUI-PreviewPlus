@@ -89,6 +89,59 @@ function jpegUserComment(buffer) {
   return null;
 }
 
+// JPEG APP1 is limited to ~64 KiB. PreviewPlus stores oversized complete
+// graphs in lossless APP15 chunks instead, which the bundled importer restores.
+function jpegChunkedGraph(buffer) {
+  const view = new DataView(buffer);
+  const end = view.byteLength;
+  if (end < 4 || view.getUint16(0) !== 0xffd8) return null;
+  const signature = new TextEncoder().encode("PreviewPlusGraph\0\x01");
+  const chunks = new Map();
+  let expected = null;
+  let totalBytes = 0;
+  let pos = 2;
+  while (pos + 4 <= end) {
+    if (view.getUint8(pos++) !== 0xff) break;
+    while (pos < end && view.getUint8(pos) === 0xff) pos++;
+    if (pos >= end) break;
+    const marker = view.getUint8(pos++);
+    if (marker === 0xd9 || marker === 0xda) break;
+    if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+    if (pos + 2 > end) break;
+    const size = view.getUint16(pos);
+    if (size < 2 || pos + size > end) break;
+    const start = pos + 2;
+    const segmentEnd = pos + size;
+    if (marker === 0xef && segmentEnd - start >= signature.length + 4) {
+      const matches = signature.every((byte, offset) => view.getUint8(start + offset) === byte);
+      if (matches) {
+        const idx = view.getUint16(start + signature.length);
+        const count = view.getUint16(start + signature.length + 2);
+        if (!count || idx >= count || (expected !== null && count !== expected)) return null;
+        expected = count;
+        if (chunks.has(idx)) return null;
+        const offset = start + signature.length + 4;
+        const part = new Uint8Array(buffer, offset, segmentEnd - offset);
+        totalBytes += part.byteLength;
+        // Do not decode arbitrarily huge EXIF-style metadata from third-party files.
+        if (totalBytes > 32 * 1024 * 1024) return null;
+        chunks.set(idx, part);
+      }
+    }
+    pos = segmentEnd;
+  }
+  if (expected === null || chunks.size !== expected) return null;
+  const merged = new Uint8Array(totalBytes);
+  let cursor = 0;
+  for (let i = 0; i < expected; i++) {
+    const chunk = chunks.get(i);
+    if (!chunk) return null;
+    merged.set(chunk, cursor);
+    cursor += chunk.byteLength;
+  }
+  return new TextDecoder("utf-8", {fatal: true}).decode(merged);
+}
+
 function jsonObject(value) {
   if (typeof value === "string") {
     try { value = JSON.parse(value); } catch { return null; }
@@ -279,7 +332,7 @@ async function chooseOutputFolder(initialPath, onSelect) {
   await browse(initialPath);
 }
 
-function saveManualImages(node) {
+async function saveManualImages(node) {
   const tokens = node.previewPlusTokens || [];
   if (!tokens.length) {
     window.alert("Preview Plus: Generate an image first.");
@@ -289,12 +342,32 @@ function saveManualImages(node) {
   const full = Boolean(node.widgets?.find(w => w.name === "workflow_json")?.value);
   for (const token of tokens) {
     const url = `/preview_plus/download/${encodeURIComponent(token)}?format=${encodeURIComponent(fmt)}&workflow_json=${full}`;
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = "";
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
+    // A failed download used to be rendered by the browser as a .txt file.
+    // Inspect HTTP status and Content-Type before offering a Save dialog.
+    try {
+      const response = await api.fetchApi(url);
+      if (!response.ok) {
+        const reason = await response.text();
+        throw new Error(reason || `HTTP ${response.status}`);
+      }
+      if (!response.headers.get("content-type")?.startsWith("image/"))
+        throw new Error("Server returned non-image content instead of a saved image");
+      const file = await response.blob();
+      const objectUrl = URL.createObjectURL(file);
+      const link = document.createElement("a");
+      const disposition = response.headers.get("content-disposition") || "";
+      const filename = /filename="?([^";]+)"?/i.exec(disposition)?.[1];
+      link.href = objectUrl;
+      link.download = filename || `preview_plus.${fmt.toLowerCase()}`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 60000);
+    } catch (error) {
+      window.alert("Preview Plus: Save failed\n" + error.message);
+      console.error("[Preview Plus] Manual save failed:", error);
+      break;
+    }
   }
 }
 
@@ -429,7 +502,8 @@ app.registerExtension({
     app.handleFile = async function (file) {
       if (file && (file.type === "image/jpeg" || /\.jpe?g$/i.test(file.name || ""))) {
         try {
-          const comment = jpegUserComment(await file.arrayBuffer());
+          const buffer = await file.arrayBuffer();
+          const comment = jpegChunkedGraph(buffer) || jpegUserComment(buffer);
           if (comment) {
             const data = jsonObject(comment);
             if (data) {
