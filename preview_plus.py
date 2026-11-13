@@ -142,6 +142,39 @@ def _exif_user_comment_undefined(exif_bytes):
             return bytes(buf)
     raise ValueError("Missing EXIF UserComment")
 
+# A JPEG APP1/EXIF segment cannot exceed 65,533 bytes. Large workflow
+# graphs are therefore stored losslessly in extra JPEG APP15 segments while
+# ordinary human-readable EXIF remains compatible with existing viewers.
+_JPEG_EXIF_LIMIT = 65533
+_JPEG_GRAPH_MARKER = b"PreviewPlusGraph\x00\x01"  # signature + protocol version
+_JPEG_GRAPH_CHUNK = 60000
+
+
+def _jpeg_graph_segments(graph):
+    """Serialize complete Comfy graph as separate, valid JPEG APP15 segments.
+
+    The bundled JS importer recognizes this container. Each JPEG segment has
+    its own 16-bit length; using multiple segments removes the APP1 limit for
+    workflow data without changing or truncating a single graph property.
+    """
+    payload = _json(graph).encode("utf-8")
+    count = max(1, (len(payload) + _JPEG_GRAPH_CHUNK - 1) // _JPEG_GRAPH_CHUNK)
+    if count > 65535:
+        raise ValueError("PreviewPlus JPG workflow exceeds chunk index range")
+    segments = []
+    for number in range(count):
+        chunk = payload[number * _JPEG_GRAPH_CHUNK:(number + 1) * _JPEG_GRAPH_CHUNK]
+        content = _JPEG_GRAPH_MARKER + struct.pack(">HH", number, count) + chunk
+        segments.append(b"\xff\xef" + struct.pack(">H", len(content) + 2) + content)
+    return b"".join(segments)
+
+
+def _jpeg_embed_graph(jpeg_data, graph):
+    if not jpeg_data.startswith(b"\xff\xd8"):
+        raise ValueError("Invalid JPEG from image encoder")
+    return jpeg_data[:2] + _jpeg_graph_segments(graph) + jpeg_data[2:]
+
+
 def _config_path():
     # Keep this outside custom_nodes: reinstalling/updating the extension must
     # not reset the user's setting. This location is shared by all workflows.
@@ -355,6 +388,10 @@ class PreviewPlus:
             "images": ("IMAGE",),
             "format": (["PNG", "JPG", "WEBP"], {"default": "PNG"}),
             "workflow_json": ("BOOLEAN", {"default": False, "label_on": "Full workflow", "label_off": "Parameters only"}),
+        }, "optional": {
+            # Connect the exact STRING sent into CLIPTextEncode, including
+            # outputs from TextGenerate or prompt switches. Socket only.
+            "prompt_text": ("STRING", {"forceInput": True}),
         }, "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO", "unique_id": "UNIQUE_ID"}}
 
     RETURN_TYPES = ()
@@ -368,7 +405,8 @@ class PreviewPlus:
         # upstream nodes are served from ComfyUI's execution cache.
         return time.time()
 
-    def preview(self, images, format="PNG", workflow_json=False, prompt=None, extra_pnginfo=None, unique_id=None):
+    def preview(self, images, format="PNG", workflow_json=False, prompt=None, extra_pnginfo=None,
+                unique_id=None, prompt_text=None):
         _clean_cache()
         from PIL import Image
         import numpy as np
@@ -385,6 +423,10 @@ class PreviewPlus:
             filename = f"preview_plus_{token}.png"
             pil.save(os.path.join(temp_dir, filename), format="PNG")
             params = _parameters(prompt, pil.width, pil.height)
+            # The execution graph contains references to dynamically produced
+            # text, not the final STRING. An optional live input solves that.
+            if prompt_text is not None:
+                params["Prompt"] = str(prompt_text)
             item = {"path": filename, "params": params, "prompt": prompt or {},
                     "extra": extra_pnginfo or {}, "time": time.time()}
             with _LOCK:
@@ -437,37 +479,48 @@ def _render_image(item, fmt, full):
         mime, extension = "image/png", "png"
     else:
         exif = Image.Exif()
-        # Identify the producer in both EXIF-based formats. The generation
-        # parameters themselves remain Forge/A1111-compatible UserComment text.
-        exif[0x0131] = "ComfyUI / Preview Plus"  # Software tag for PixMeta.
-        # Forge always reads human-readable A1111 text from EXIF UserComment.
-        # UNICODE header + UTF-16BE is the encoding piexif expects.
+        # Human-readable A1111 parameters stay in EXIF UserComment for
+        # Forge/PixMeta, independent of the complete Comfy workflow graph.
+        exif[0x0131] = "ComfyUI / Preview Plus"
         exif[0x8769] = {0x9286: b"UNICODE\x00" + metadata.encode("utf-16-be")}
+        graph = None
         if full:
+            graph = dict(item["extra"])
+            graph["prompt"] = item["prompt"]
             if fmt == "JPG":
-                # Keep existing v0.6 JPG layout unchanged: Forge reads the
-                # human-readable UserComment and our JPG importer reads the graph.
-                native = dict(item["extra"])
-                native["prompt"] = item["prompt"]
-                exif[0x010E] = json.dumps(native, ensure_ascii=True, separators=(",", ":"), default=str)
+                # Backward compatibility: keep small graphs in the original
+                # ImageDescription field. Large graphs move to APP15 chunks.
+                exif[0x010E] = json.dumps(
+                    graph, ensure_ascii=True, separators=(",", ":"), default=str)
             else:
-                # ComfyUI's *native WebP loader* reads EXIF ASCII tag strings
-                # formatted as 'workflow:{JSON}' (Make, 0x010F) and
-                # 'prompt:{JSON}' (Model, 0x0110). UserComment stays plain text
-                # so Forge PNG Info and older image viewers remain readable.
+                # Native ComfyUI WebP metadata: EXIF Make/Model tags. Unlike
+                # JPEG APP1, WebP's EXIF RIFF chunk supports large payloads.
                 workflow = item["extra"].get("workflow")
                 if workflow is not None:
                     exif[0x010F] = "workflow:" + json.dumps(
                         workflow, ensure_ascii=True, separators=(",", ":"), default=str)
                 exif[0x0110] = "prompt:" + json.dumps(
                     item["prompt"], ensure_ascii=True, separators=(",", ":"), default=str)
+
         exif_bytes = _exif_user_comment_undefined(exif.tobytes())
-        if len(exif_bytes) > 60000:
-            raise web.HTTPRequestEntityTooLarge(max_size=60000, actual_size=len(exif_bytes),
-                text="Metadata too large for JPG/WEBP EXIF. Use PNG or disable full workflow JSON.")
+        large_jpeg_graph = False
+        if fmt == "JPG" and len(exif_bytes) > _JPEG_EXIF_LIMIT and full:
+            # ImageDescription is what made EXIF too large. Move only the full
+            # graph into lossless APP15 segments; leave UserComment intact.
+            del exif[0x010E]
+            exif_bytes = _exif_user_comment_undefined(exif.tobytes())
+            large_jpeg_graph = True
+        if fmt == "JPG" and len(exif_bytes) > _JPEG_EXIF_LIMIT:
+            raise ValueError(
+                "PreviewPlus: readable JPEG EXIF parameters exceed the JPEG APP1 limit. "
+                "Use PNG or WebP, or shorten the manually connected prompt_text.")
         image = image.convert("RGB")
         if fmt == "JPG":
             image.save(output, format="JPEG", quality=100, subsampling=0, exif=exif_bytes)
+            if large_jpeg_graph:
+                # The bundled JPG importer restores these graphs on drop.
+                output_data = _jpeg_embed_graph(output.getvalue(), graph)
+                output = io.BytesIO(output_data)
             mime, extension = "image/jpeg", "jpg"
         else:
             image.save(output, format="WEBP", lossless=True, exif=exif_bytes)
