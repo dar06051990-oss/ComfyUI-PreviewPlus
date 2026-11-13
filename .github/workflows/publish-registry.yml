@@ -1,0 +1,30 @@
+name: Publish PreviewPlus to Comfy Registry
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "pyproject.toml"
+
+permissions:
+  contents: read
+
+jobs:
+  publish-node:
+    name: Publish PreviewPlus
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify Registry access token
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
+        run: |
+          if [ -z "$REGISTRY_TOKEN" ]; then
+            echo "::error::Missing REGISTRY_ACCESS_TOKEN. Add it in Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+      - name: Publish to ComfyUI Registry
+        uses: Comfy-Org/publish-node-action@v1
+        with:
+          personal_access_token: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
